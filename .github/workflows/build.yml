@@ -15,7 +15,8 @@ jobs:
           sudo apt-get install -y \
             build-essential bc flex bison libssl-dev \
             python3 libelf-dev cpio kmod \
-            gcc-aarch64-linux-gnu
+            gcc-aarch64-linux-gnu \
+            libdw-dev
 
       - name: Find kernel branch
         run: |
