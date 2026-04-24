@@ -1,0 +1,756 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * ios_brightness.c
+ * iOS-Style Brightness Control Kernel Module
+ * Device:  Redmi K90 Pro Max (myron/canoe, Snapdragon 8 Elite)
+ * Panel:   CSOT NT37801 2K LTPO AMOLED, 14-bit PWM (max=16383)
+ * Kernel:  6.12.23-android16-5 (GKI, SukiSU Ultra)
+ * ALS:     Goodix GLSX via SSC (userspace bridge required)
+ */
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+#include <linux/uaccess.h>
+#include <linux/backlight.h>
+#include <linux/kthread.h>
+#include <linux/kprobes.h>
+#include <linux/mutex.h>
+#include <linux/spinlock.h>
+#include <linux/workqueue.h>
+#include <linux/sched.h>
+#include <linux/jiffies.h>
+#include <linux/math64.h>
+#include <linux/device.h>
+#include <linux/notifier.h>
+#include <linux/fb.h>
+#include <linux/string.h>
+
+/* ─── Module Parameters ─── */
+
+static char *bl_dev_name = "panel0-backlight";
+module_param(bl_dev_name, charp, 0644);
+MODULE_PARM_DESC(bl_dev_name, "Backlight device name");
+
+static int def_max_raw = 16383;
+module_param(def_max_raw, int, 0644);
+MODULE_PARM_DESC(def_max_raw, "Max raw brightness (K90PM=16383)");
+
+static int def_min_raw = 1;
+module_param(def_min_raw, int, 0644);
+MODULE_PARM_DESC(def_min_raw, "Min raw brightness");
+
+static int def_gamma_x100 = 250;
+module_param(def_gamma_x100, int, 0644);
+MODULE_PARM_DESC(def_gamma_x100, "Gamma * 100 (250=2.5)");
+
+static int def_transition_ms = 300;
+module_param(def_transition_ms, int, 0644);
+MODULE_PARM_DESC(def_transition_ms, "Transition ms");
+
+/* ─── Constants ─── */
+
+#define PROC_DIR       "ios_brightness"
+#define SLIDER_MAX     1000
+#define SMOOTH_SAMPLES 5
+#define HYSTERESIS     8
+
+/* ─── Mode ─── */
+
+enum ios_mode { MODE_MANUAL = 0, MODE_AUTO = 1, MODE_OVERLAY = 2 };
+static const char *mode_str[] = { "manual", "auto", "overlay" };
+
+/* ─── Lux -> Slider Table (iOS-style) ─── */
+
+struct lux_map { int lux; int slider; };
+
+static const struct lux_map lux_table[] = {
+	{     0,   15 }, {     5,   40 }, {    20,   90 },
+	{    50,  160 }, {   100,  240 }, {   200,  320 },
+	{   500,  460 }, {  1000,  580 }, {  3000,  730 },
+	{  5000,  810 }, { 10000,  890 }, { 30000,  950 },
+	{ 50000, 1000 },
+};
+#define LUX_TABLE_SZ ARRAY_SIZE(lux_table)
+
+/* ─── Context ─── */
+
+struct ios_ctx {
+	struct backlight_device *bl;
+	bool        enabled;
+	enum ios_mode mode;
+	bool        display_on;
+
+	unsigned long cur_raw, target_raw;
+	unsigned long manual_slider, auto_slider;
+	unsigned long max_raw, min_raw;
+	int           gamma_x100;
+
+	/* transition animation */
+	struct task_struct *thr;
+	bool          thr_run;
+	unsigned long t_from, t_to;
+	ktime_t       t_start;
+	unsigned int  t_ms;
+
+	/* auto brightness */
+	struct delayed_work als_work;
+	int  poll_ms;
+	int  lux;
+	int  lux_buf[SMOOTH_SAMPLES];
+	int  lux_idx;
+	int  prev_auto;
+
+	/* userspace lux feed */
+	int  lux_feed;
+	bool lux_feed_valid;
+
+	/* kprobe */
+	struct kprobe kp;
+	bool kp_on;
+
+	/* fb notifier */
+	struct notifier_block fb_nb;
+
+	/* procfs */
+	struct proc_dir_entry *proc;
+
+	/* locks */
+	struct mutex mtx;
+	spinlock_t   spn;
+};
+
+static struct ios_ctx C;
+
+/* ═══════════════════════════════════════════════
+ *  Integer Gamma Math (no float in kernel)
+ * ═══════════════════════════════════════════════ */
+
+static unsigned long ipow(unsigned long x, int gx)
+{
+	u64 x64, r, next, gi, gf;
+	int i;
+
+	if (x == 0)    return 0;
+	if (x >= 1000) return 1000;
+	if (gx == 100) return x;
+
+	x64 = (u64)x;
+
+	/* gamma=2.5 fast path */
+	if (gx == 250) {
+		r = x64 * x64 * int_sqrt(x64 * 1000) / 1000000ULL;
+		return (unsigned long)min_t(u64, r, 1000);
+	}
+	/* gamma=2.0 */
+	if (gx == 200) {
+		r = x64 * x64 / 1000ULL;
+		return (unsigned long)min_t(u64, r, 1000);
+	}
+	/* gamma=3.0 */
+	if (gx == 300) {
+		r = x64 * x64 * x64 / 1000000ULL;
+		return (unsigned long)min_t(u64, r, 1000);
+	}
+
+	/* general: integer multiply + fractional interpolation */
+	gi = gx / 100;
+	gf = gx % 100;
+	r = 1000;
+	for (i = 0; i < (int)gi; i++)
+		r = r * x64 / 1000ULL;
+	if (gf > 0) {
+		next = r * x64 / 1000ULL;
+		r = r + (next - r) * gf / 100ULL;
+	}
+	return (unsigned long)min_t(u64, r, 1000);
+}
+
+/* ═══════════════════════════════════════════════
+ *  Brightness Curve Engine
+ * ═══════════════════════════════════════════════ */
+
+static unsigned long slider_to_raw(unsigned long s)
+{
+	unsigned long range, pct;
+
+	if (s >= SLIDER_MAX) return C.max_raw;
+	if (s == 0)          return C.min_raw;
+
+	range = C.max_raw - C.min_raw;
+	pct   = ipow(s, C.gamma_x100);
+	return clamp_val(C.min_raw + range * pct / SLIDER_MAX,
+			 C.min_raw, C.max_raw);
+}
+
+static unsigned long raw_to_slider(unsigned long r)
+{
+	unsigned long lo = 0, hi = SLIDER_MAX, mid, v, vlo, vhi;
+
+	if (r <= C.min_raw) return 0;
+	if (r >= C.max_raw) return SLIDER_MAX;
+
+	while (hi - lo > 1) {
+		mid = (lo + hi) / 2;
+		v = slider_to_raw(mid);
+		if (v < r) lo = mid; else hi = mid;
+	}
+	vlo = slider_to_raw(lo);
+	vhi = slider_to_raw(hi);
+	if (vhi == vlo) return lo;
+	return lo + (r - vlo) * (hi - lo) / (vhi - vlo);
+}
+
+/* ═══════════════════════════════════════════════
+ *  Auto Brightness Engine
+ * ═══════════════════════════════════════════════ */
+
+static int lux_to_slider(int lux)
+{
+	int i;
+	if (lux <= 0) return lux_table[0].slider;
+	if (lux >= lux_table[LUX_TABLE_SZ - 1].lux)
+		return lux_table[LUX_TABLE_SZ - 1].slider;
+
+	for (i = 1; i < (int)LUX_TABLE_SZ; i++) {
+		if (lux <= lux_table[i].lux) {
+			int l0 = lux_table[i-1].lux, l1 = lux_table[i].lux;
+			int s0 = lux_table[i-1].slider, s1 = lux_table[i].slider;
+			if (l1 == l0) return s0;
+			return s0 + (s1 - s0) * (lux - l0) / (l1 - l0);
+		}
+	}
+	return SLIDER_MAX;
+}
+
+static int smooth_lux(int raw)
+{
+	int i, sum;
+	C.lux_buf[C.lux_idx] = raw;
+	C.lux_idx = (C.lux_idx + 1) % SMOOTH_SAMPLES;
+	for (i = 0, sum = 0; i < SMOOTH_SAMPLES; i++)
+		sum += C.lux_buf[i];
+	return sum / SMOOTH_SAMPLES;
+}
+
+static void als_work_fn(struct work_struct *w)
+{
+	int lux, sl, new_raw;
+
+	if (!C.enabled || C.mode != MODE_AUTO || !C.display_on)
+		goto resched;
+
+	if (!C.lux_feed_valid)
+		goto resched;
+
+	lux = C.lux_feed;
+	C.lux = lux;
+	lux = smooth_lux(lux);
+	sl = lux_to_slider(lux);
+
+	if (abs(sl - C.prev_auto) < HYSTERESIS)
+		goto resched;
+
+	C.prev_auto   = sl;
+	C.auto_slider = sl;
+
+	mutex_lock(&C.mtx);
+	new_raw = slider_to_raw(sl);
+	if (new_raw != C.cur_raw) {
+		C.t_from  = C.cur_raw;
+		C.t_to    = clamp_val(new_raw, C.min_raw, C.max_raw);
+		C.t_start = ktime_get();
+		spin_lock(&C.spn);
+		C.thr_run = true;
+		spin_unlock(&C.spn);
+	}
+	mutex_unlock(&C.mtx);
+
+resched:
+	if (C.enabled && C.mode == MODE_AUTO)
+		schedule_delayed_work(&C.als_work,
+				      msecs_to_jiffies(C.poll_ms));
+}
+
+/* ═══════════════════════════════════════════════
+ *  Hardware Brightness Write
+ * ═══════════════════════════════════════════════ */
+
+static void hw_set(unsigned long raw)
+{
+	if (!C.bl || !C.bl->ops) return;
+	raw = clamp_val(raw, C.min_raw, C.max_raw);
+	C.cur_raw = raw;
+	mutex_lock(&C.bl->update_lock);
+	C.bl->props.brightness = (int)raw;
+	if (C.bl->ops->update_status)
+		C.bl->ops->update_status(C.bl);
+	mutex_unlock(&C.bl->update_lock);
+}
+
+/* ═══════════════════════════════════════════════
+ *  60fps Smooth Transition (cubic ease-in-out)
+ * ═══════════════════════════════════════════════ */
+
+static unsigned long ease_cubic(unsigned long t)
+{
+	u64 tt, u, r;
+	if (t == 0)       return 0;
+	if (t >= 1000000) return 1000000;
+	tt = (u64)t;
+	if (tt < 500000) {
+		r = 4ULL * tt * tt * tt / 1000000000000ULL;
+	} else {
+		u = 2000000ULL - 2ULL * tt;
+		u = u * u * u / 1000000000000ULL;
+		r = 1000000ULL - u / 2ULL;
+	}
+	return (unsigned long)clamp_val(r, 0, 1000000);
+}
+
+static int trans_fn(void *data)
+{
+	unsigned long el, pr, ez, rng, raw;
+
+	while (!kthread_should_stop()) {
+		if (!C.thr_run || !C.display_on) {
+			usleep_range(20000, 25000);
+			continue;
+		}
+		el = (unsigned long)ktime_ms_delta(ktime_get(), C.t_start);
+		if (el >= C.t_ms) {
+			spin_lock(&C.spn);
+			C.thr_run = false;
+			spin_unlock(&C.spn);
+			hw_set(C.t_to);
+			usleep_range(5000, 8000);
+			continue;
+		}
+		pr = el * 1000000UL / C.t_ms;
+		ez = ease_cubic(pr);
+		if (C.t_to >= C.t_from) {
+			rng = C.t_to - C.t_from;
+			raw = C.t_from + rng * ez / 1000000UL;
+		} else {
+			rng = C.t_from - C.t_to;
+			raw = C.t_from - rng * ez / 1000000UL;
+		}
+		hw_set(raw);
+		usleep_range(15000, 17000);
+	}
+	return 0;
+}
+
+static void start_trans(unsigned long target)
+{
+	target = clamp_val(target, C.min_raw, C.max_raw);
+	if (target == C.cur_raw) { C.thr_run = false; return; }
+	C.t_from  = C.cur_raw;
+	C.t_to    = target;
+	C.t_start = ktime_get();
+	C.t_ms    = C.t_ms > 0 ? C.t_ms : def_transition_ms;
+	spin_lock(&C.spn);
+	C.thr_run = true;
+	spin_unlock(&C.spn);
+}
+
+/* ═══════════════════════════════════════════════
+ *  Kprobe: Intercept Android brightness writes
+ * ═══════════════════════════════════════════════ */
+
+static int kp_pre(struct kprobe *p, struct pt_regs *regs)
+{
+	struct backlight_device *bd;
+	unsigned long req, s;
+
+	if (!C.enabled) return 0;
+	bd = (struct backlight_device *)regs->regs[0];
+	if (bd != C.bl) return 0;
+
+	switch (C.mode) {
+	case MODE_MANUAL:
+	case MODE_AUTO:
+		regs->regs[1] = C.cur_raw;
+		break;
+	case MODE_OVERLAY:
+		req = regs->regs[1];
+		s = raw_to_slider(req);
+		regs->regs[1] = slider_to_raw(s);
+		break;
+	}
+	return 0;
+}
+
+/* ═══════════════════════════════════════════════
+ *  FB Notifier: Screen on/off
+ * ═══════════════════════════════════════════════ */
+
+static int fb_cb(struct notifier_block *nb, unsigned long act, void *d)
+{
+	struct fb_event *ev = d;
+	int *blank;
+	if (act != FB_EVENT_BLANK || !ev || !ev->data) return NOTIFY_OK;
+	blank = (int *)ev->data;
+	mutex_lock(&C.mtx);
+	if (*blank == FB_BLANK_UNBLANK) {
+		C.display_on = true;
+		if (C.enabled) {
+			unsigned long s = (C.mode == MODE_AUTO) ?
+				C.auto_slider : C.manual_slider;
+			start_trans(slider_to_raw(s));
+		}
+	} else {
+		C.display_on = false;
+		C.thr_run = false;
+	}
+	mutex_unlock(&C.mtx);
+	return NOTIFY_OK;
+}
+
+/* ═══════════════════════════════════════════════
+ *  Procfs Interface
+ * ═══════════════════════════════════════════════ */
+
+/* --- enabled --- */
+static int p_en_show(struct seq_file *m, void *v)
+{ seq_printf(m, "%d\n", C.enabled ? 1 : 0); return 0; }
+
+static ssize_t p_en_write(struct file *f, const char __user *b,
+			   size_t c, loff_t *p)
+{
+	char k[8]; int v;
+	if (c >= sizeof(k)) return -EINVAL;
+	if (copy_from_user(k, b, c)) return -EFAULT;
+	k[c] = '\0';
+	if (kstrtoint(k, 0, &v)) return -EINVAL;
+	mutex_lock(&C.mtx);
+	C.enabled = !!v;
+	if (C.enabled) {
+		unsigned long s = (C.mode == MODE_AUTO) ?
+			C.auto_slider : C.manual_slider;
+		start_trans(slider_to_raw(s));
+		if (C.mode == MODE_AUTO)
+			schedule_delayed_work(&C.als_work,
+					      msecs_to_jiffies(50));
+	} else {
+		cancel_delayed_work_sync(&C.als_work);
+		C.thr_run = false;
+	}
+	mutex_unlock(&C.mtx);
+	pr_info("ios_brightness: %s\n", v ? "enabled" : "disabled");
+	return c;
+}
+
+/* --- mode --- */
+static int p_mode_show(struct seq_file *m, void *v)
+{ seq_printf(m, "%s\n", mode_str[C.mode]); return 0; }
+
+static ssize_t p_mode_write(struct file *f, const char __user *b,
+			     size_t c, loff_t *p)
+{
+	char k[16]; size_t l;
+	if (c >= sizeof(k)) return -EINVAL;
+	if (copy_from_user(k, b, c)) return -EFAULT;
+	k[c] = '\0';
+	l = strcspn(k, "\n\r "); k[l] = '\0';
+	mutex_lock(&C.mtx);
+	if (!strcmp(k, "auto")) {
+		C.mode = MODE_AUTO;
+		if (C.enabled)
+			schedule_delayed_work(&C.als_work,
+					      msecs_to_jiffies(50));
+	} else if (!strcmp(k, "manual")) {
+		C.mode = MODE_MANUAL;
+		cancel_delayed_work_sync(&C.als_work);
+	} else if (!strcmp(k, "overlay")) {
+		C.mode = MODE_OVERLAY;
+		cancel_delayed_work_sync(&C.als_work);
+	} else {
+		mutex_unlock(&C.mtx);
+		return -EINVAL;
+	}
+	if (C.enabled) {
+		unsigned long s = (C.mode == MODE_AUTO) ?
+			C.auto_slider : C.manual_slider;
+		start_trans(slider_to_raw(s));
+	}
+	mutex_unlock(&C.mtx);
+	pr_info("ios_brightness: mode -> %s\n", k);
+	return c;
+}
+
+/* --- set_brightness (write-only, 0-1000) --- */
+static ssize_t p_set_write(struct file *f, const char __user *b,
+			    size_t c, loff_t *p)
+{
+	char k[16]; unsigned long s;
+	if (c >= sizeof(k)) return -EINVAL;
+	if (copy_from_user(k, b, c)) return -EFAULT;
+	k[c] = '\0';
+	if (kstrtoul(k, 0, &s)) return -EINVAL;
+	if (s > SLIDER_MAX) s = SLIDER_MAX;
+	mutex_lock(&C.mtx);
+	C.manual_slider = s;
+	if (C.enabled && C.mode == MODE_MANUAL)
+		start_trans(slider_to_raw(s));
+	mutex_unlock(&C.mtx);
+	return c;
+}
+
+/* --- lux_feed (write-only) --- */
+static ssize_t p_lux_write(struct file *f, const char __user *b,
+			    size_t c, loff_t *p)
+{
+	char k[16]; int lux;
+	if (c >= sizeof(k)) return -EINVAL;
+	if (copy_from_user(k, b, c)) return -EFAULT;
+	k[c] = '\0';
+	if (kstrtoint(k, 0, &lux)) return -EINVAL;
+	mutex_lock(&C.mtx);
+	C.lux_feed = lux;
+	C.lux_feed_valid = true;
+	mutex_unlock(&C.mtx);
+	return c;
+}
+
+/* --- brightness (read-only) --- */
+static int p_bri_show(struct seq_file *m, void *v)
+{
+	unsigned long s = raw_to_slider(C.cur_raw);
+	seq_printf(m, "%lu (%.1f%%) raw=%lu\n", s, s / 10.0f, C.cur_raw);
+	return 0;
+}
+
+/* --- lux (read-only) --- */
+static int p_luxro_show(struct seq_file *m, void *v)
+{ seq_printf(m, "%d\n", C.lux); return 0; }
+
+/* --- gamma --- */
+static int p_gam_show(struct seq_file *m, void *v)
+{ seq_printf(m, "%.2f\n", C.gamma_x100 / 100.0f); return 0; }
+
+static ssize_t p_gam_write(struct file *f, const char __user *b,
+			    size_t c, loff_t *p)
+{
+	char k[12]; int v;
+	if (c >= sizeof(k)) return -EINVAL;
+	if (copy_from_user(k, b, c)) return -EFAULT;
+	k[c] = '\0';
+	if (kstrtoint(k, 0, &v)) return -EINVAL;
+	if (v < 100 || v > 500) return -EINVAL;
+	mutex_lock(&C.mtx);
+	C.gamma_x100 = v;
+	if (C.enabled) {
+		unsigned long s = (C.mode == MODE_AUTO) ?
+			C.auto_slider : C.manual_slider;
+		start_trans(slider_to_raw(s));
+	}
+	mutex_unlock(&C.mtx);
+	pr_info("ios_brightness: gamma -> %.2f\n", v / 100.0f);
+	return c;
+}
+
+/* --- transition_ms --- */
+static int p_tr_show(struct seq_file *m, void *v)
+{ seq_printf(m, "%u\n", C.t_ms); return 0; }
+
+static ssize_t p_tr_write(struct file *f, const char __user *b,
+			   size_t c, loff_t *p)
+{
+	char k[12]; unsigned int v;
+	if (c >= sizeof(k)) return -EINVAL;
+	if (copy_from_user(k, b, c)) return -EFAULT;
+	k[c] = '\0';
+	if (kstrtouint(k, 0, &v)) return -EINVAL;
+	if (v > 2000) v = 2000;
+	C.t_ms = v;
+	return c;
+}
+
+/* --- status (read-only) --- */
+static int p_sta_show(struct seq_file *m, void *v)
+{
+	unsigned long s = raw_to_slider(C.cur_raw);
+	seq_printf(m,
+		"=== iOS Brightness (K90 Pro Max) ===\n"
+		"Enabled:     %s\n"
+		"Mode:        %s\n"
+		"Display:     %s\n"
+		"Current:     %lu (%.1f%%) raw=%lu\n"
+		"Manual:      %lu (%.1f%%)\n"
+		"Auto:        %lu (%.1f%%)\n"
+		"Gamma:       %.2f\n"
+		"Min/Max:     %lu / %lu\n"
+		"Transition:  %u ms %s\n"
+		"Lux:         %d (feed=%s)\n"
+		"Kprobe:      %s\n",
+		C.enabled ? "yes" : "no",
+		mode_str[C.mode],
+		C.display_on ? "on" : "off",
+		s, s / 10.0f, C.cur_raw,
+		C.manual_slider, C.manual_slider / 10.0f,
+		C.auto_slider, C.auto_slider / 10.0f,
+		C.gamma_x100 / 100.0f,
+		C.min_raw, C.max_raw,
+		C.t_ms, C.thr_run ? "ACTIVE" : "idle",
+		C.lux, C.lux_feed_valid ? "on" : "off",
+		C.kp_on ? "active" : "off"
+	);
+	if (C.bl)
+		seq_printf(m, "BL device:   %s (hw_max=%d)\n",
+			   bl_dev_name, C.bl->props.max_brightness);
+	return 0;
+}
+
+/* --- Procfs boilerplate --- */
+
+#define PFS(N) \
+	static int p_##N##_open(struct inode *i, struct file *f) \
+	{ return single_open(f, p_##N##_show, NULL); } \
+	static const struct proc_ops p_##N##_ops = { \
+		.proc_open = p_##N##_open, .proc_read = seq_read, \
+		.proc_lseek = seq_lseek, .proc_release = single_release }
+
+#define PFRW(N) \
+	static int p_##N##_open(struct inode *i, struct file *f) \
+	{ return single_open(f, p_##N##_show, NULL); } \
+	static const struct proc_ops p_##N##_ops = { \
+		.proc_open = p_##N##_open, .proc_read = seq_read, \
+		.proc_write = p_##N##_write, \
+		.proc_lseek = seq_lseek, .proc_release = single_release }
+
+#define PFW(N) \
+	static const struct proc_ops p_##N##_ops = { \
+		.proc_write = p_##N##_write }
+
+PFRW(en);
+PFRW(mode);
+PFW(set);
+PFW(lux);
+PFS(bri);
+PFS(luxro);
+PFRW(gam);
+PFRW(tr);
+PFS(sta);
+
+static int create_proc(void)
+{
+	struct proc_dir_entry *d = proc_mkdir(PROC_DIR, NULL);
+	if (!d) return -ENOMEM;
+	C.proc = d;
+#define CP(N,M) proc_create(#N, M, d, &p_##N##_ops)
+	CP(en,    0644);
+	CP(mode,  0644);
+	CP(set,   0200);
+	CP(lux,   0200);
+	CP(bri,   0444);
+	CP(luxro, 0444);
+	CP(gam,   0644);
+	CP(tr,    0644);
+	CP(sta,   0444);
+#undef CP
+	return 0;
+}
+
+static void destroy_proc(void)
+{
+	if (C.proc) { remove_proc_subtree(PROC_DIR, NULL); C.proc = NULL; }
+}
+
+/* ═══════════════════════════════════════════════
+ *  Init & Exit
+ * ═══════════════════════════════════════════════ */
+
+static int __init ios_brightness_init(void)
+{
+	struct device *dev;
+	int ret;
+
+	memset(&C, 0, sizeof(C));
+	mutex_init(&C.mtx);
+	spin_lock_init(&C.spn);
+
+	C.mode          = MODE_MANUAL;
+	C.display_on    = true;
+	C.gamma_x100    = def_gamma_x100;
+	C.min_raw       = def_min_raw;
+	C.max_raw       = def_max_raw;
+	C.manual_slider = 500;
+	C.auto_slider   = 250;
+	C.t_ms          = def_transition_ms;
+	C.poll_ms       = 200;
+	C.prev_auto     = -1;
+
+	dev = class_find_device_by_name(backlight_class, NULL,
+					bl_dev_name, NULL);
+	if (!dev) {
+		pr_err("ios_brightness: '%s' not found\n", bl_dev_name);
+		return -ENODEV;
+	}
+	C.bl = to_backlight_device(dev);
+	if (C.bl->props.max_brightness > 0)
+		C.max_raw = C.bl->props.max_brightness;
+	C.cur_raw = C.bl->props.brightness;
+
+	pr_info("ios_brightness: bl=%s max=%lu cur=%lu\n",
+		bl_dev_name, C.max_raw, C.cur_raw);
+
+	INIT_DELAYED_WORK(&C.als_work, als_work_fn);
+
+	C.thr = kthread_run(trans_fn, NULL, "ios_br");
+	if (IS_ERR(C.thr)) {
+		ret = PTR_ERR(C.thr);
+		goto err;
+	}
+
+	C.kp.symbol_name = "backlight_device_set_brightness";
+	C.kp.pre_handler = kp_pre;
+	if (register_kprobe(&C.kp) == 0) {
+		C.kp_on = true;
+		pr_info("ios_brightness: kprobe active\n");
+	} else {
+		pr_warn("ios_brightness: kprobe failed\n");
+	}
+
+	C.fb_nb.notifier_call = fb_cb;
+	fb_register_client(&C.fb_nb);
+
+	ret = create_proc();
+	if (ret < 0) goto err;
+
+	pr_info("ios_brightness: ready -> echo 1 > /proc/%s/enabled\n",
+		PROC_DIR);
+	return 0;
+
+err:
+	if (!IS_ERR_OR_NULL(C.thr)) kthread_stop(C.thr);
+	cancel_delayed_work_sync(&C.als_work);
+	return ret;
+}
+
+static void __exit ios_brightness_exit(void)
+{
+	C.enabled = false;
+	cancel_delayed_work_sync(&C.als_work);
+	C.thr_run = false;
+	if (!IS_ERR_OR_NULL(C.thr)) kthread_stop(C.thr);
+	if (C.kp_on) { unregister_kprobe(&C.kp); C.kp_on = false; }
+	fb_unregister_client(&C.fb_nb);
+	destroy_proc();
+	if (C.bl && C.bl->ops && C.bl->ops->update_status) {
+		mutex_lock(&C.bl->update_lock);
+		C.bl->ops->update_status(C.bl);
+		mutex_unlock(&C.bl->update_lock);
+	}
+	pr_info("ios_brightness: unloaded, stock control restored\n");
+}
+
+module_init(ios_brightness_init);
+module_exit(ios_brightness_exit);
+
+MODULE_LICENSE("GPL v2");
+MODULE_AUTHOR("MiMo");
+MODULE_DESCRIPTION("iOS-style brightness for K90 Pro Max on SukiSU Ultra");
+MODULE_VERSION("2.0.0");
