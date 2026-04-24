@@ -12,11 +12,19 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git build-essential bc flex bison libssl-dev python3 libelf-dev cpio kmod
+          sudo apt-get install -y \
+            build-essential bc flex bison libssl-dev \
+            python3 libelf-dev cpio kmod \
+            gcc-aarch64-linux-gnu
 
-      - name: Clone Android common kernel
+      - name: Clone kernel
         run: |
-          git clone --depth=1 -b android16-6.12 https://android.googlesource.com/kernel/common kernel
+          git clone --depth=1 -b android15-6.6 \
+            https://android.googlesource.com/kernel/common \
+            kernel
+
+      - name: Show kernel version
+        run: head -5 kernel/Makefile
 
       - name: Setup module
         run: |
@@ -38,6 +46,7 @@ jobs:
       - name: Collect
         run: |
           cp kernel/drivers/misc/ios_brightness.ko ./
+          echo "=== SUCCESS ==="
           modinfo ios_brightness.ko || true
           cat kernel/include/config/kernel.release
 
