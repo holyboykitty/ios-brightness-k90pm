@@ -1,0 +1,61 @@
+name: Build ios_brightness module
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git build-essential bc flex bison libssl-dev \
+            python3 libelf-dev cpio kmod
+
+      - name: Clone Android common kernel
+        run: |
+          git clone --depth=1 \
+            -b android16-6.12 \
+            https://android.googlesource.com/kernel/common \
+            kernel
+
+      - name: Setup module
+        run: |
+          cp ios_brightness.c kernel/drivers/misc/
+          echo 'obj-$(CONFIG_IOS_BRIGHTNESS) += ios_brightness.o' \
+            >> kernel/drivers/misc/Makefile
+          cat >> kernel/drivers/misc/Kconfig << 'KCFG'
+config IOS_BRIGHTNESS
+	tristate "iOS-style brightness control"
+	depends on BACKLIGHT_CLASS_DEVICE
+	default m
+KCFG
+
+      - name: Build
+        run: |
+          cd kernel
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make gki_defconfig
+          echo 'CONFIG_IOS_BRIGHTNESS=m' >> .config
+          make olddefconfig
+          make -j$(nproc)
+          make M=drivers/misc modules
+
+      - name: Collect
+        run: |
+          cp kernel/drivers/misc/ios_brightness.ko ./
+          echo "=== Module info ==="
+          modinfo ios_brightness.ko || true
+          echo "=== Kernel release ==="
+          cat kernel/include/config/kernel.release
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios_brightness-module
+          path: ios_brightness.ko
