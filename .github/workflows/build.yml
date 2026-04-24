@@ -53,9 +53,11 @@ jobs:
 
       - name: Setup module
         run: |
-          cp ios_brightness.c kernel/drivers/misc/
-          echo 'obj-$(CONFIG_IOS_BRIGHTNESS) += ios_brightness.o' >> kernel/drivers/misc/Makefile
-          printf 'config IOS_BRIGHTNESS\n\ttristate "iOS brightness"\n\tdepends on BACKLIGHT_CLASS_DEVICE\n\tdefault m\n' >> kernel/drivers/misc/Kconfig
+          mkdir -p kernel/drivers/misc/ios_brightness
+          cp ios_brightness.c kernel/drivers/misc/ios_brightness/
+          cat > kernel/drivers/misc/ios_brightness/Makefile << 'EOF'
+          obj-m := ios_brightness.o
+          EOF
 
       - name: Prepare kernel (no full build)
         run: |
@@ -73,21 +75,22 @@ jobs:
           cd kernel
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
-          make M=drivers/misc modules
+          make gki_defconfig
+          echo 'CONFIG_IOS_BRIGHTNESS=m' >> .config
+          make olddefconfig
+          make modules_prepare
+          make scripts
+          make M=drivers/misc/ios_brightness modules
 
       - name: Collect
         run: |
-          if [ -f kernel/drivers/misc/ios_brightness.ko ]; then
-            cp kernel/drivers/misc/ios_brightness.ko ./
+          if [ -f kernel/drivers/misc/ios_brightness/ios_brightness.ko ]; then
+            cp kernel/drivers/misc/ios_brightness/ios_brightness.ko ./
             echo "=== BUILD SUCCESS ==="
             modinfo ios_brightness.ko
-            echo "=== vermagic ==="
-            strings ios_brightness.ko | grep vermagic
-            cat kernel/include/config/kernel.release
           else
             echo "=== BUILD FAILED ==="
-            find kernel/drivers/misc/ -name "*.ko" -o -name "*.o" 2>/dev/null
-            echo "=== Check errors above ==="
+            ls -la kernel/drivers/misc/ios_brightness/
             exit 1
           fi
 
