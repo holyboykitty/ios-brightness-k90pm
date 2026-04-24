@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * ios_brightness.c
- * iOS-Style Brightness Control Kernel Module
+ * ios_brightness.c — iOS-Style Brightness Control
  * Device:  Redmi K90 Pro Max (myron/canoe, Snapdragon 8 Elite)
  * Panel:   CSOT NT37801 2K LTPO AMOLED, 14-bit PWM (max=16383)
- * Kernel:  6.12.23-android16-5 (GKI, SukiSU Ultra)
+ * Kernel:  6.12 (GKI, SukiSU Ultra)
  * ALS:     Goodix GLSX via SSC (userspace bridge required)
  */
 
@@ -14,7 +13,6 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
-#include <linux/backlight.h>
 #include <linux/kthread.h>
 #include <linux/kprobes.h>
 #include <linux/mutex.h>
@@ -23,16 +21,18 @@
 #include <linux/sched.h>
 #include <linux/jiffies.h>
 #include <linux/math64.h>
-#include <linux/device.h>
 #include <linux/notifier.h>
 #include <linux/fb.h>
 #include <linux/string.h>
+#include <linux/delay.h>
+#include <linux/fs.h>
+#include <linux/file.h>
 
 /* ─── Module Parameters ─── */
 
-static char *bl_dev_name = "panel0-backlight";
-module_param(bl_dev_name, charp, 0644);
-MODULE_PARM_DESC(bl_dev_name, "Backlight device name");
+static char *bl_sysfs_path = "/sys/class/backlight/panel0-backlight/brightness";
+module_param(bl_sysfs_path, charp, 0644);
+MODULE_PARM_DESC(bl_sysfs_path, "Backlight brightness sysfs path");
 
 static int def_max_raw = 16383;
 module_param(def_max_raw, int, 0644);
@@ -56,6 +56,7 @@ MODULE_PARM_DESC(def_transition_ms, "Transition ms");
 #define SLIDER_MAX     1000
 #define SMOOTH_SAMPLES 5
 #define HYSTERESIS     8
+#define BL_BUF_SZ      16
 
 /* ─── Mode ─── */
 
@@ -78,12 +79,11 @@ static const struct lux_map lux_table[] = {
 /* ─── Context ─── */
 
 struct ios_ctx {
-	struct backlight_device *bl;
 	bool        enabled;
 	enum ios_mode mode;
 	bool        display_on;
 
-	unsigned long cur_raw, target_raw;
+	unsigned long cur_raw;
 	unsigned long manual_slider, auto_slider;
 	unsigned long max_raw, min_raw;
 	int           gamma_x100;
@@ -107,10 +107,6 @@ struct ios_ctx {
 	int  lux_feed;
 	bool lux_feed_valid;
 
-	/* kprobe */
-	struct kprobe kp;
-	bool kp_on;
-
 	/* fb notifier */
 	struct notifier_block fb_nb;
 
@@ -123,6 +119,35 @@ struct ios_ctx {
 };
 
 static struct ios_ctx C;
+
+/* ═══════════════════════════════════════════════
+ *  Sysfs backlight write (no backlight API dependency)
+ * ═══════════════════════════════════════════════ */
+
+static void hw_set(unsigned long raw)
+{
+	struct file *f;
+	char buf[BL_BUF_SZ];
+	int len;
+	loff_t pos = 0;
+	ssize_t ret;
+
+	raw = clamp_val(raw, C.min_raw, C.max_raw);
+	C.cur_raw = raw;
+
+	len = snprintf(buf, sizeof(buf), "%lu\n", raw);
+
+	f = filp_open(bl_sysfs_path, O_WRONLY, 0);
+	if (IS_ERR(f)) {
+		pr_warn("ios_brightness: cannot open %s (%ld)\n",
+			bl_sysfs_path, PTR_ERR(f));
+		return;
+	}
+	ret = kernel_write(f, buf, len, &pos);
+	if (ret < 0)
+		pr_warn("ios_brightness: write failed (%zd)\n", ret);
+	filp_close(f, NULL);
+}
 
 /* ═══════════════════════════════════════════════
  *  Integer Gamma Math (no float in kernel)
@@ -139,23 +164,19 @@ static unsigned long ipow(unsigned long x, int gx)
 
 	x64 = (u64)x;
 
-	/* gamma=2.5 fast path */
 	if (gx == 250) {
 		r = x64 * x64 * int_sqrt(x64 * 1000) / 1000000ULL;
 		return (unsigned long)min_t(u64, r, 1000);
 	}
-	/* gamma=2.0 */
 	if (gx == 200) {
 		r = x64 * x64 / 1000ULL;
 		return (unsigned long)min_t(u64, r, 1000);
 	}
-	/* gamma=3.0 */
 	if (gx == 300) {
 		r = x64 * x64 * x64 / 1000000ULL;
 		return (unsigned long)min_t(u64, r, 1000);
 	}
 
-	/* general: integer multiply + fractional interpolation */
 	gi = gx / 100;
 	gf = gx % 100;
 	r = 1000;
@@ -275,22 +296,6 @@ resched:
 }
 
 /* ═══════════════════════════════════════════════
- *  Hardware Brightness Write
- * ═══════════════════════════════════════════════ */
-
-static void hw_set(unsigned long raw)
-{
-	if (!C.bl || !C.bl->ops) return;
-	raw = clamp_val(raw, C.min_raw, C.max_raw);
-	C.cur_raw = raw;
-	mutex_lock(&C.bl->update_lock);
-	C.bl->props.brightness = (int)raw;
-	if (C.bl->ops->update_status)
-		C.bl->ops->update_status(C.bl);
-	mutex_unlock(&C.bl->update_lock);
-}
-
-/* ═══════════════════════════════════════════════
  *  60fps Smooth Transition (cubic ease-in-out)
  * ═══════════════════════════════════════════════ */
 
@@ -316,7 +321,7 @@ static int trans_fn(void *data)
 
 	while (!kthread_should_stop()) {
 		if (!C.thr_run || !C.display_on) {
-			usleep_range(20000, 25000);
+			usleep_range_state(20000, 25000, TASK_UNINTERRUPTIBLE);
 			continue;
 		}
 		el = (unsigned long)ktime_ms_delta(ktime_get(), C.t_start);
@@ -325,7 +330,7 @@ static int trans_fn(void *data)
 			C.thr_run = false;
 			spin_unlock(&C.spn);
 			hw_set(C.t_to);
-			usleep_range(5000, 8000);
+			usleep_range_state(5000, 8000, TASK_UNINTERRUPTIBLE);
 			continue;
 		}
 		pr = el * 1000000UL / C.t_ms;
@@ -338,7 +343,7 @@ static int trans_fn(void *data)
 			raw = C.t_from - rng * ez / 1000000UL;
 		}
 		hw_set(raw);
-		usleep_range(15000, 17000);
+		usleep_range_state(15000, 17000, TASK_UNINTERRUPTIBLE);
 	}
 	return 0;
 }
@@ -354,33 +359,6 @@ static void start_trans(unsigned long target)
 	spin_lock(&C.spn);
 	C.thr_run = true;
 	spin_unlock(&C.spn);
-}
-
-/* ═══════════════════════════════════════════════
- *  Kprobe: Intercept Android brightness writes
- * ═══════════════════════════════════════════════ */
-
-static int kp_pre(struct kprobe *p, struct pt_regs *regs)
-{
-	struct backlight_device *bd;
-	unsigned long req, s;
-
-	if (!C.enabled) return 0;
-	bd = (struct backlight_device *)regs->regs[0];
-	if (bd != C.bl) return 0;
-
-	switch (C.mode) {
-	case MODE_MANUAL:
-	case MODE_AUTO:
-		regs->regs[1] = C.cur_raw;
-		break;
-	case MODE_OVERLAY:
-		req = regs->regs[1];
-		s = raw_to_slider(req);
-		regs->regs[1] = slider_to_raw(s);
-		break;
-	}
-	return 0;
 }
 
 /* ═══════════════════════════════════════════════
@@ -413,7 +391,6 @@ static int fb_cb(struct notifier_block *nb, unsigned long act, void *d)
  *  Procfs Interface
  * ═══════════════════════════════════════════════ */
 
-/* --- enabled --- */
 static int p_en_show(struct seq_file *m, void *v)
 { seq_printf(m, "%d\n", C.enabled ? 1 : 0); return 0; }
 
@@ -443,7 +420,6 @@ static ssize_t p_en_write(struct file *f, const char __user *b,
 	return c;
 }
 
-/* --- mode --- */
 static int p_mode_show(struct seq_file *m, void *v)
 { seq_printf(m, "%s\n", mode_str[C.mode]); return 0; }
 
@@ -481,7 +457,6 @@ static ssize_t p_mode_write(struct file *f, const char __user *b,
 	return c;
 }
 
-/* --- set_brightness (write-only, 0-1000) --- */
 static ssize_t p_set_write(struct file *f, const char __user *b,
 			    size_t c, loff_t *p)
 {
@@ -499,7 +474,6 @@ static ssize_t p_set_write(struct file *f, const char __user *b,
 	return c;
 }
 
-/* --- lux_feed (write-only) --- */
 static ssize_t p_lux_write(struct file *f, const char __user *b,
 			    size_t c, loff_t *p)
 {
@@ -515,7 +489,6 @@ static ssize_t p_lux_write(struct file *f, const char __user *b,
 	return c;
 }
 
-/* --- brightness (read-only) --- */
 static int p_bri_show(struct seq_file *m, void *v)
 {
 	unsigned long s = raw_to_slider(C.cur_raw);
@@ -523,11 +496,9 @@ static int p_bri_show(struct seq_file *m, void *v)
 	return 0;
 }
 
-/* --- lux (read-only) --- */
 static int p_luxro_show(struct seq_file *m, void *v)
 { seq_printf(m, "%d\n", C.lux); return 0; }
 
-/* --- gamma --- */
 static int p_gam_show(struct seq_file *m, void *v)
 { seq_printf(m, "%.2f\n", C.gamma_x100 / 100.0f); return 0; }
 
@@ -552,7 +523,6 @@ static ssize_t p_gam_write(struct file *f, const char __user *b,
 	return c;
 }
 
-/* --- transition_ms --- */
 static int p_tr_show(struct seq_file *m, void *v)
 { seq_printf(m, "%u\n", C.t_ms); return 0; }
 
@@ -569,7 +539,6 @@ static ssize_t p_tr_write(struct file *f, const char __user *b,
 	return c;
 }
 
-/* --- status (read-only) --- */
 static int p_sta_show(struct seq_file *m, void *v)
 {
 	unsigned long s = raw_to_slider(C.cur_raw);
@@ -585,7 +554,7 @@ static int p_sta_show(struct seq_file *m, void *v)
 		"Min/Max:     %lu / %lu\n"
 		"Transition:  %u ms %s\n"
 		"Lux:         %d (feed=%s)\n"
-		"Kprobe:      %s\n",
+		"BL path:     %s\n",
 		C.enabled ? "yes" : "no",
 		mode_str[C.mode],
 		C.display_on ? "on" : "off",
@@ -596,11 +565,8 @@ static int p_sta_show(struct seq_file *m, void *v)
 		C.min_raw, C.max_raw,
 		C.t_ms, C.thr_run ? "ACTIVE" : "idle",
 		C.lux, C.lux_feed_valid ? "on" : "off",
-		C.kp_on ? "active" : "off"
+		bl_sysfs_path
 	);
-	if (C.bl)
-		seq_printf(m, "BL device:   %s (hw_max=%d)\n",
-			   bl_dev_name, C.bl->props.max_brightness);
 	return 0;
 }
 
@@ -665,8 +631,8 @@ static void destroy_proc(void)
 
 static int __init ios_brightness_init(void)
 {
-	struct device *dev;
 	int ret;
+	struct file *f;
 
 	memset(&C, 0, sizeof(C));
 	mutex_init(&C.mtx);
@@ -683,19 +649,15 @@ static int __init ios_brightness_init(void)
 	C.poll_ms       = 200;
 	C.prev_auto     = -1;
 
-	dev = class_find_device_by_name(backlight_class, NULL,
-					bl_dev_name, NULL);
-	if (!dev) {
-		pr_err("ios_brightness: '%s' not found\n", bl_dev_name);
+	/* 验证背光 sysfs 路径存在 */
+	f = filp_open(bl_sysfs_path, O_RDONLY, 0);
+	if (IS_ERR(f)) {
+		pr_err("ios_brightness: '%s' not found (%ld)\n",
+		       bl_sysfs_path, PTR_ERR(f));
 		return -ENODEV;
 	}
-	C.bl = to_backlight_device(dev);
-	if (C.bl->props.max_brightness > 0)
-		C.max_raw = C.bl->props.max_brightness;
-	C.cur_raw = C.bl->props.brightness;
-
-	pr_info("ios_brightness: bl=%s max=%lu cur=%lu\n",
-		bl_dev_name, C.max_raw, C.cur_raw);
+	filp_close(f, NULL);
+	pr_info("ios_brightness: backlight path ok: %s\n", bl_sysfs_path);
 
 	INIT_DELAYED_WORK(&C.als_work, als_work_fn);
 
@@ -703,15 +665,6 @@ static int __init ios_brightness_init(void)
 	if (IS_ERR(C.thr)) {
 		ret = PTR_ERR(C.thr);
 		goto err;
-	}
-
-	C.kp.symbol_name = "backlight_device_set_brightness";
-	C.kp.pre_handler = kp_pre;
-	if (register_kprobe(&C.kp) == 0) {
-		C.kp_on = true;
-		pr_info("ios_brightness: kprobe active\n");
-	} else {
-		pr_warn("ios_brightness: kprobe failed\n");
 	}
 
 	C.fb_nb.notifier_call = fb_cb;
@@ -736,15 +689,9 @@ static void __exit ios_brightness_exit(void)
 	cancel_delayed_work_sync(&C.als_work);
 	C.thr_run = false;
 	if (!IS_ERR_OR_NULL(C.thr)) kthread_stop(C.thr);
-	if (C.kp_on) { unregister_kprobe(&C.kp); C.kp_on = false; }
 	fb_unregister_client(&C.fb_nb);
 	destroy_proc();
-	if (C.bl && C.bl->ops && C.bl->ops->update_status) {
-		mutex_lock(&C.bl->update_lock);
-		C.bl->ops->update_status(C.bl);
-		mutex_unlock(&C.bl->update_lock);
-	}
-	pr_info("ios_brightness: unloaded, stock control restored\n");
+	pr_info("ios_brightness: unloaded\n");
 }
 
 module_init(ios_brightness_init);
