@@ -17,22 +17,46 @@ jobs:
             python3 libelf-dev cpio kmod \
             gcc-aarch64-linux-gnu
 
+      - name: Find kernel branch
+        run: |
+          echo "=== Searching branches ==="
+          git ls-remote --heads https://android.googlesource.com/kernel/common 2>/dev/null | \
+            grep -E "6\.(6|12)" | tail -20
+
       - name: Clone kernel
         run: |
-          git clone --depth=1 -b android15-6.6 \
-            https://android.googlesource.com/kernel/common \
-            kernel
+          CLONED=0
+          for BRANCH in \
+            "android16-6.12" \
+            "common-android16-6.12" \
+            "android16-6.12-android16-5" \
+            "android15-6.6"; do
+            echo "Trying: $BRANCH"
+            if git clone --depth=1 -b "$BRANCH" \
+              https://android.googlesource.com/kernel/common \
+              kernel 2>/dev/null; then
+              echo "SUCCESS: $BRANCH"
+              CLONED=1
+              break
+            fi
+            rm -rf kernel
+          done
+          if [ "$CLONED" = "0" ]; then
+            echo "FAILED to clone"
+            exit 1
+          fi
 
-      - name: Show kernel version
-        run: head -5 kernel/Makefile
+      - name: Show kernel info
+        run: |
+          head -5 kernel/Makefile
 
       - name: Setup module
         run: |
           cp ios_brightness.c kernel/drivers/misc/
           echo 'obj-$(CONFIG_IOS_BRIGHTNESS) += ios_brightness.o' >> kernel/drivers/misc/Makefile
-          printf 'config IOS_BRIGHTNESS\n\ttristate "iOS-style brightness control"\n\tdepends on BACKLIGHT_CLASS_DEVICE\n\tdefault m\n' >> kernel/drivers/misc/Kconfig
+          printf 'config IOS_BRIGHTNESS\n\ttristate "iOS brightness"\n\tdepends on BACKLIGHT_CLASS_DEVICE\n\tdefault m\n' >> kernel/drivers/misc/Kconfig
 
-      - name: Build
+      - name: Prepare kernel (no full build)
         run: |
           cd kernel
           export ARCH=arm64
@@ -40,15 +64,31 @@ jobs:
           make gki_defconfig
           echo 'CONFIG_IOS_BRIGHTNESS=m' >> .config
           make olddefconfig
-          make -j$(nproc)
+          make modules_prepare
+          make scripts
+
+      - name: Build module only
+        run: |
+          cd kernel
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
           make M=drivers/misc modules
 
       - name: Collect
         run: |
-          cp kernel/drivers/misc/ios_brightness.ko ./
-          echo "=== SUCCESS ==="
-          modinfo ios_brightness.ko || true
-          cat kernel/include/config/kernel.release
+          if [ -f kernel/drivers/misc/ios_brightness.ko ]; then
+            cp kernel/drivers/misc/ios_brightness.ko ./
+            echo "=== BUILD SUCCESS ==="
+            modinfo ios_brightness.ko
+            echo "=== vermagic ==="
+            strings ios_brightness.ko | grep vermagic
+            cat kernel/include/config/kernel.release
+          else
+            echo "=== BUILD FAILED ==="
+            find kernel/drivers/misc/ -name "*.ko" -o -name "*.o" 2>/dev/null
+            echo "=== Check errors above ==="
+            exit 1
+          fi
 
       - name: Upload
         uses: actions/upload-artifact@v4
