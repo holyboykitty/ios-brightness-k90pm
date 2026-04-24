@@ -12,28 +12,17 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            git build-essential bc flex bison libssl-dev \
-            python3 libelf-dev cpio kmod
+          sudo apt-get install -y git build-essential bc flex bison libssl-dev python3 libelf-dev cpio kmod
 
       - name: Clone Android common kernel
         run: |
-          git clone --depth=1 \
-            -b android16-6.12 \
-            https://android.googlesource.com/kernel/common \
-            kernel
+          git clone --depth=1 -b android16-6.12 https://android.googlesource.com/kernel/common kernel
 
       - name: Setup module
         run: |
           cp ios_brightness.c kernel/drivers/misc/
-          echo 'obj-$(CONFIG_IOS_BRIGHTNESS) += ios_brightness.o' \
-            >> kernel/drivers/misc/Makefile
-          cat >> kernel/drivers/misc/Kconfig << 'KCFG'
-config IOS_BRIGHTNESS
-	tristate "iOS-style brightness control"
-	depends on BACKLIGHT_CLASS_DEVICE
-	default m
-KCFG
+          echo 'obj-$(CONFIG_IOS_BRIGHTNESS) += ios_brightness.o' >> kernel/drivers/misc/Makefile
+          printf 'config IOS_BRIGHTNESS\n\ttristate "iOS-style brightness control"\n\tdepends on BACKLIGHT_CLASS_DEVICE\n\tdefault m\n' >> kernel/drivers/misc/Kconfig
 
       - name: Build
         run: |
@@ -49,9 +38,7 @@ KCFG
       - name: Collect
         run: |
           cp kernel/drivers/misc/ios_brightness.ko ./
-          echo "=== Module info ==="
           modinfo ios_brightness.ko || true
-          echo "=== Kernel release ==="
           cat kernel/include/config/kernel.release
 
       - name: Upload
