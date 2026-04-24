@@ -14,7 +14,6 @@
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
 #include <linux/kthread.h>
-#include <linux/kprobes.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
@@ -321,7 +320,7 @@ static int trans_fn(void *data)
 
 	while (!kthread_should_stop()) {
 		if (!C.thr_run || !C.display_on) {
-			usleep_range_state(20000, 25000, TASK_UNINTERRUPTIBLE);
+			msleep(20);
 			continue;
 		}
 		el = (unsigned long)ktime_ms_delta(ktime_get(), C.t_start);
@@ -330,7 +329,7 @@ static int trans_fn(void *data)
 			C.thr_run = false;
 			spin_unlock(&C.spn);
 			hw_set(C.t_to);
-			usleep_range_state(5000, 8000, TASK_UNINTERRUPTIBLE);
+			msleep(5);
 			continue;
 		}
 		pr = el * 1000000UL / C.t_ms;
@@ -343,7 +342,7 @@ static int trans_fn(void *data)
 			raw = C.t_from - rng * ez / 1000000UL;
 		}
 		hw_set(raw);
-		usleep_range_state(15000, 17000, TASK_UNINTERRUPTIBLE);
+		msleep(16);
 	}
 	return 0;
 }
@@ -492,7 +491,8 @@ static ssize_t p_lux_write(struct file *f, const char __user *b,
 static int p_bri_show(struct seq_file *m, void *v)
 {
 	unsigned long s = raw_to_slider(C.cur_raw);
-	seq_printf(m, "%lu (%.1f%%) raw=%lu\n", s, s / 10.0f, C.cur_raw);
+	seq_printf(m, "%lu (%lu.%lu%%) raw=%lu\n",
+		   s, s / 10, s % 10, C.cur_raw);
 	return 0;
 }
 
@@ -500,7 +500,7 @@ static int p_luxro_show(struct seq_file *m, void *v)
 { seq_printf(m, "%d\n", C.lux); return 0; }
 
 static int p_gam_show(struct seq_file *m, void *v)
-{ seq_printf(m, "%.2f\n", C.gamma_x100 / 100.0f); return 0; }
+{ seq_printf(m, "%d.%02d\n", C.gamma_x100 / 100, C.gamma_x100 % 100); return 0; }
 
 static ssize_t p_gam_write(struct file *f, const char __user *b,
 			    size_t c, loff_t *p)
@@ -519,7 +519,7 @@ static ssize_t p_gam_write(struct file *f, const char __user *b,
 		start_trans(slider_to_raw(s));
 	}
 	mutex_unlock(&C.mtx);
-	pr_info("ios_brightness: gamma -> %.2f\n", v / 100.0f);
+	pr_info("ios_brightness: gamma -> %d.%02d\n", v / 100, v % 100);
 	return c;
 }
 
@@ -547,10 +547,10 @@ static int p_sta_show(struct seq_file *m, void *v)
 		"Enabled:     %s\n"
 		"Mode:        %s\n"
 		"Display:     %s\n"
-		"Current:     %lu (%.1f%%) raw=%lu\n"
-		"Manual:      %lu (%.1f%%)\n"
-		"Auto:        %lu (%.1f%%)\n"
-		"Gamma:       %.2f\n"
+		"Current:     %lu (%lu.%lu%%) raw=%lu\n"
+		"Manual:      %lu (%lu.%lu%%)\n"
+		"Auto:        %lu (%lu.%lu%%)\n"
+		"Gamma:       %d.%02d\n"
 		"Min/Max:     %lu / %lu\n"
 		"Transition:  %u ms %s\n"
 		"Lux:         %d (feed=%s)\n"
@@ -558,10 +558,10 @@ static int p_sta_show(struct seq_file *m, void *v)
 		C.enabled ? "yes" : "no",
 		mode_str[C.mode],
 		C.display_on ? "on" : "off",
-		s, s / 10.0f, C.cur_raw,
-		C.manual_slider, C.manual_slider / 10.0f,
-		C.auto_slider, C.auto_slider / 10.0f,
-		C.gamma_x100 / 100.0f,
+		s, s / 10, s % 10, C.cur_raw,
+		C.manual_slider, C.manual_slider / 10, C.manual_slider % 10,
+		C.auto_slider, C.auto_slider / 10, C.auto_slider % 10,
+		C.gamma_x100 / 100, C.gamma_x100 % 100,
 		C.min_raw, C.max_raw,
 		C.t_ms, C.thr_run ? "ACTIVE" : "idle",
 		C.lux, C.lux_feed_valid ? "on" : "off",
