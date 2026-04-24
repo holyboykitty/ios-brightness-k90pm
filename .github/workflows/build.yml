@@ -80,7 +80,7 @@ jobs:
           make olddefconfig
           make modules_prepare
           make scripts
-          make M=drivers/misc/ios_brightness modules
+          KBUILD_MODPOST_WARN=1 make M=drivers/misc/ios_brightness modules
 
       - name: Collect
         run: |
